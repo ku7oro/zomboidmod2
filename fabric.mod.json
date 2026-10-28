@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "zomboidmod",
+  "version": "0.2.0",
+  "name": "Zomboid Survival",
+  "description": "Thirst system inspired by Project Zomboid.",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.example.zomboidmod.ZomboidMod"],
+    "client": ["com.example.zomboidmod.ZomboidClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
