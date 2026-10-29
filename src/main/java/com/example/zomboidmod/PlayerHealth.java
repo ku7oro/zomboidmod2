@@ -8,6 +8,7 @@ public class PlayerHealth {
     public int zombieTimer = 0;            // секунд с момента заражения
     public int painLeft = 0;               // секунд действия обезболивающего
     public double bleedAcc = 0;            // накопленная кровопотеря (не сохраняется)
+    public int capPercent = 100;           // максимум здоровья из-за травм, % (не сохраняется)
 
     public PlayerHealth() {
         for (int i = 0; i < parts.length; i++) parts[i] = new PartState();

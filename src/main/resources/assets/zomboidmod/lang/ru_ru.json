@@ -5,5 +5,7 @@
   "item.zomboidmod.suture_kit": "Набор для швов",
   "item.zomboidmod.splint": "Шина",
   "item.zomboidmod.painkillers": "Обезболивающее",
-  "item.zomboidmod.antibiotics": "Антибиотики"
+  "item.zomboidmod.antibiotics": "Антибиотики",
+  "key.zomboidmod.health": "Панель здоровья",
+  "category.zomboidmod": "Zomboid Survival"
 }

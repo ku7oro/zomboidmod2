@@ -8,25 +8,42 @@ import net.minecraft.entity.effect.StatusEffect;
 import net.minecraft.entity.effect.StatusEffectInstance;
 import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.entity.mob.ZombieEntity;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
 import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.registry.tag.DamageTypeTags;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.sound.SoundCategory;
+import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.random.Random;
 
 import java.util.function.Predicate;
 
-/** Система ран и лечения в духе Project Zomboid. */
+/** Здоровье в духе Project Zomboid: 17 частей тела, раны, перелом, инфекция, лечение. */
 public class Wounds {
     // ===== Настройки (в секундах) =====
-    private static final int BANDAGE_DIRTY_AFTER = 300; // бинт пачкается
-    private static final int FRACTURE_HEAL = 1800;      // перелом срастается в шине
-    private static final int PAINKILLER_TIME = 300;     // действие обезболивающего
+    private static final int BANDAGE_DIRTY_AFTER = 300;
+    private static final int FRACTURE_HEAL = 1800;
+    private static final int PAINKILLER_TIME = 300;
 
     // Вирус зомби
     private static final int VIRUS_WEAK_AT = 180;
     private static final int VIRUS_SICK_AT = 360;
     private static final int VIRUS_DEATH_AT = 600;
+
+    // Восстановление здоровья (HP в секунду; всего 20 HP)
+    private static final double REGEN_BASE = 0.02;
+    private static final double REGEN_SLEEP_MULT = 5.0;
+
+    private static final int TOTAL_WEIGHT;
+
+    static {
+        int t = 0;
+        for (BodyPart bp : BodyPart.values()) t += bp.weight;
+        TOTAL_WEIGHT = t;
+    }
 
     public static PlayerHealth health(ServerPlayerEntity p) {
         return HealthState.get(p.getServer()).of(p.getUuid());
@@ -50,7 +67,7 @@ public class Wounds {
         Entity attacker = source.getAttacker();
 
         if (source.isIn(DamageTypeTags.IS_FALL)) {
-            BodyPart leg = r.nextBoolean() ? BodyPart.LEFT_LEG : BodyPart.RIGHT_LEG;
+            BodyPart leg = randomLeg(r);
             if (amount >= 5.0f && r.nextFloat() < 0.35f) addFracture(p, leg);
             else if (amount >= 3.0f) addWound(p, leg, WoundType.CUT);
             else addWound(p, leg, WoundType.SCRATCH);
@@ -73,13 +90,18 @@ public class Wounds {
     }
 
     private static BodyPart randomPart(Random r) {
-        int n = r.nextInt(100);
-        if (n < 10) return BodyPart.HEAD;
-        if (n < 45) return BodyPart.TORSO;
-        if (n < 60) return BodyPart.LEFT_ARM;
-        if (n < 75) return BodyPart.RIGHT_ARM;
-        if (n < 88) return BodyPart.LEFT_LEG;
-        return BodyPart.RIGHT_LEG;
+        int n = r.nextInt(TOTAL_WEIGHT);
+        for (BodyPart bp : BodyPart.values()) {
+            n -= bp.weight;
+            if (n < 0) return bp;
+        }
+        return BodyPart.UPPER_TORSO;
+    }
+
+    private static BodyPart randomLeg(Random r) {
+        BodyPart[] legs = {BodyPart.L_THIGH, BodyPart.R_THIGH, BodyPart.L_SHIN, BodyPart.R_SHIN,
+                BodyPart.L_FOOT, BodyPart.R_FOOT};
+        return legs[r.nextInt(legs.length)];
     }
 
     public static void addWound(ServerPlayerEntity p, BodyPart part, WoundType type) {
@@ -90,12 +112,15 @@ public class Wounds {
         s.type = type.ordinal();
         s.bleedLeft = type.bleedSeconds;
         s.heal = type.healSeconds;
+        // Раны на шее кровоточат, пока их не перевяжут
+        if (part == BodyPart.NECK && type.bleedSeconds != 0) s.bleedLeft = -1;
         p.sendMessage(Text.literal("Рана: " + type.title + " (" + part.title.toLowerCase() + ")"), true);
         markDirty(p);
         sync(p);
     }
 
     public static void addFracture(ServerPlayerEntity p, BodyPart part) {
+        if (!part.canFracture()) return;
         PartState s = health(p).parts[part.ordinal()];
         if (s.fracture) return;
         s.fracture = true;
@@ -116,38 +141,66 @@ public class Wounds {
     }
 
     // ===== Лечение =====
+
+    /** Лечение предметом из руки: часть тела подбирается автоматически. */
     public static boolean treat(ServerPlayerEntity p, MedItem.Kind kind) {
         PlayerHealth h = health(p);
+        int idx;
+        switch (kind) {
+            case BANDAGE -> idx = pick(h, s -> s.type != 0 && (!s.bandaged || s.dirty));
+            case ANTISEPTIC -> idx = pick(h, s -> s.type != 0 && !s.disinfected);
+            case SUTURE -> idx = pick(h, s -> s.wound() == WoundType.DEEP && !s.stitched);
+            case SPLINT -> idx = pick(h, s -> s.fracture && !s.splinted);
+            default -> idx = 0;
+        }
+        if (idx < 0) return fail(p, noTarget(kind));
+        return treatPart(p, kind, idx);
+    }
+
+    private static String noTarget(MedItem.Kind kind) {
+        return switch (kind) {
+            case BANDAGE -> "Нечего перевязывать";
+            case ANTISEPTIC -> "Нечего обрабатывать";
+            case SUTURE -> "Зашивать нечего (нужна глубокая рана)";
+            case SPLINT -> "Нет перелома без шины";
+            default -> "Не подходит";
+        };
+    }
+
+    /** Лечение конкретной части тела (из меню панели здоровья или из руки). */
+    public static boolean treatPart(ServerPlayerEntity p, MedItem.Kind kind, int idx) {
+        PlayerHealth h = health(p);
+        PartState s = h.parts[idx];
+        String name = BodyPart.values()[idx].title.toLowerCase();
         switch (kind) {
             case BANDAGE -> {
-                int i = pick(h, s -> s.type != 0 && (!s.bandaged || s.dirty));
-                if (i < 0) return fail(p, "Нечего перевязывать");
-                PartState s = h.parts[i];
+                if (s.type == 0) return fail(p, "На этой части тела нет раны");
+                if (s.bandaged && !s.dirty) return fail(p, "Рана уже перевязана");
                 s.bandaged = true;
                 s.dirty = false;
                 s.bandageAge = 0;
-                done(p, "Бинт наложен: " + BodyPart.values()[i].title.toLowerCase());
+                done(p, "Бинт наложен: " + name);
                 return true;
             }
             case ANTISEPTIC -> {
-                int i = pick(h, s -> s.type != 0 && !s.disinfected);
-                if (i < 0) return fail(p, "Нечего обрабатывать");
-                h.parts[i].disinfected = true;
-                done(p, "Рана обработана: " + BodyPart.values()[i].title.toLowerCase());
+                if (s.type == 0) return fail(p, "На этой части тела нет раны");
+                if (s.disinfected) return fail(p, "Рана уже обработана");
+                s.disinfected = true;
+                done(p, "Рана обработана: " + name);
                 return true;
             }
             case SUTURE -> {
-                int i = pick(h, s -> s.wound() == WoundType.DEEP && !s.stitched);
-                if (i < 0) return fail(p, "Зашивать нечего (нужна глубокая рана)");
-                h.parts[i].stitched = true;
-                done(p, "Швы наложены: " + BodyPart.values()[i].title.toLowerCase());
+                if (s.wound() != WoundType.DEEP) return fail(p, "Зашивать можно только глубокую рану");
+                if (s.stitched) return fail(p, "Рана уже зашита");
+                s.stitched = true;
+                done(p, "Швы наложены: " + name);
                 return true;
             }
             case SPLINT -> {
-                int i = pick(h, s -> s.fracture && !s.splinted);
-                if (i < 0) return fail(p, "Нет перелома без шины");
-                h.parts[i].splinted = true;
-                done(p, "Шина наложена: " + BodyPart.values()[i].title.toLowerCase());
+                if (!s.fracture) return fail(p, "Здесь нет перелома");
+                if (s.splinted) return fail(p, "Шина уже наложена");
+                s.splinted = true;
+                done(p, "Шина наложена: " + name);
                 return true;
             }
             case PAINKILLERS -> {
@@ -157,9 +210,9 @@ public class Wounds {
             }
             case ANTIBIOTICS -> {
                 boolean any = false;
-                for (PartState s : h.parts) {
-                    if (s.infected) {
-                        s.infected = false;
+                for (PartState ps : h.parts) {
+                    if (ps.infected) {
+                        ps.infected = false;
                         any = true;
                     }
                 }
@@ -171,13 +224,45 @@ public class Wounds {
         return false;
     }
 
-    /** Выбирает самую срочную подходящую часть тела: сначала кровоточащие, потом по тяжести. */
+    /** Лечение из меню панели здоровья: проверяем предмет в инвентаре и тратим его. */
+    public static void treatFromMenu(ServerPlayerEntity p, int part, int action) {
+        if (part < 0 || part >= BodyPart.values().length) return;
+        if (action < 0 || action >= MedItem.Kind.values().length) return;
+        MedItem.Kind kind = MedItem.Kind.values()[action];
+        Item item = ZomboidMod.itemFor(kind);
+        if (!p.isCreative() && !takeItem(p, item, true)) {
+            fail(p, "В инвентаре нет нужного предмета");
+            return;
+        }
+        if (treatPart(p, kind, part)) {
+            if (kind.drinkSound) {
+                p.getWorld().playSound(null, p.getBlockPos(), SoundEvents.ENTITY_GENERIC_DRINK,
+                        SoundCategory.PLAYERS, 0.8f, 1.0f);
+            }
+            if (!p.isCreative()) takeItem(p, item, false);
+        }
+    }
+
+    private static boolean takeItem(ServerPlayerEntity p, Item item, boolean onlyCheck) {
+        PlayerInventory inv = p.getInventory();
+        for (int i = 0; i < inv.size(); i++) {
+            ItemStack st = inv.getStack(i);
+            if (st.isOf(item)) {
+                if (!onlyCheck) st.decrement(1);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Самая срочная подходящая часть тела: сначала кровоточащие, потом по тяжести. */
     private static int pick(PlayerHealth h, Predicate<PartState> filter) {
         int best = -1, bestScore = -1;
         for (int i = 0; i < h.parts.length; i++) {
             PartState s = h.parts[i];
             if (!filter.test(s)) continue;
-            int score = (s.isBleeding() ? 100 : 0) + s.wound().rank * 10 + (s.fracture ? 5 : 0);
+            int score = (s.isBleeding() ? 100 : 0) + s.wound().rank * 10 + (s.fracture ? 5 : 0)
+                    + (i == BodyPart.NECK.ordinal() ? 50 : 0);
             if (score > bestScore) {
                 bestScore = score;
                 best = i;
@@ -207,6 +292,7 @@ public class Wounds {
         double bleed = 0;
         int legPain = 0, armPain = 0, headPain = 0, torsoPain = 0;
         boolean legFracture = false, armFracture = false, anyInfected = false;
+        int penalty = 0;
         Random r = p.getRandom();
 
         for (int i = 0; i < h.parts.length; i++) {
@@ -226,7 +312,7 @@ public class Wounds {
 
                 // кровотечение
                 if (s.bleedLeft > 0) s.bleedLeft--;
-                if (s.isBleeding()) bleed += bleedRate(s, t);
+                if (s.isBleeding()) bleed += bleedRate(s, t, part);
 
                 // заражение раны
                 if (!s.infected && sec % 30 == 0 && !(s.bandaged && !s.dirty)) {
@@ -253,7 +339,10 @@ public class Wounds {
                 }
             }
 
-            int pain = s.wound().rank;
+            int rank = s.wound().rank;
+            int pain = rank;
+            penalty += rank * (part == BodyPart.NECK ? 4 : 2);
+            if (s.infected) penalty += 8;
 
             // перелом
             if (s.fracture) {
@@ -266,17 +355,25 @@ public class Wounds {
                     }
                 }
                 pain += s.splinted ? 2 : 4;
+                penalty += s.splinted ? 8 : 12;
                 if (!s.splinted) {
                     if (part.isLeg()) legFracture = true;
                     if (part.isArm()) armFracture = true;
                 }
             }
 
-            if (part.isLeg()) legPain += pain;
-            else if (part.isArm()) armPain += pain;
-            else if (part == BodyPart.HEAD) headPain += pain;
-            else torsoPain += pain;
+            switch (part.group) {
+                case LEG -> legPain += pain;
+                case ARM -> armPain += pain;
+                case HEAD -> headPain += pain;
+                case TORSO -> torsoPain += pain;
+            }
         }
+
+        // максимум здоровья ограничен травмами
+        h.capPercent = Math.max(20, 100 - penalty);
+        float capHp = p.getMaxHealth() * h.capPercent / 100f;
+        if (p.getHealth() > capHp) p.setHealth(capHp);
 
         // кровопотеря
         h.bleedAcc += bleed;
@@ -294,7 +391,7 @@ public class Wounds {
             }
         }
 
-        // боль от ран (обезболивающее её глушит, но не неподвижный перелом ноги или руки)
+        // боль (обезболивающее её глушит, но не неподвижный перелом)
         if (legFracture) effect(p, StatusEffects.SLOWNESS, 2);
         else if (!suppressed) {
             if (legPain >= 3) effect(p, StatusEffects.SLOWNESS, 1);
@@ -316,6 +413,18 @@ public class Wounds {
         }
         if (!suppressed && torsoPain >= 2) effect(p, StatusEffects.WEAKNESS, 0);
 
+        // восстановление здоровья: нужны покой, еда и вода; сон ускоряет
+        int thirst = ZomboidMod.getThirst(p);
+        int food = p.getHungerManager().getFoodLevel();
+        boolean canHeal = bleed == 0 && !anyInfected && !h.zombieInfected && thirst >= 20 && food >= 6;
+        if (canHeal && p.getHealth() < capHp) {
+            double rate = REGEN_BASE;
+            if (thirst >= 60) rate *= 1.25;
+            if (food >= 16) rate *= 1.5;
+            if (p.isSleeping()) rate *= REGEN_SLEEP_MULT;
+            p.setHealth(Math.min(capHp, p.getHealth() + (float) rate));
+        }
+
         // вирус зомби
         if (h.zombieInfected) {
             h.zombieTimer++;
@@ -332,21 +441,24 @@ public class Wounds {
         sync(p);
     }
 
-    private static double bleedRate(PartState s, WoundType t) {
-        return switch (t) {
+    private static double bleedRate(PartState s, WoundType t, BodyPart part) {
+        double base = switch (t) {
             case SCRATCH -> 0.05;
             case CUT -> 0.10;
             case DEEP -> s.bandaged ? 0.12 : 0.25;
             case BITE -> 0.15;
             default -> 0.0;
         };
+        // Раны на шее особенно опасны: быстро истощают здоровье, пока не перевязаны
+        if (part == BodyPart.NECK) base *= 3.0;
+        return base;
     }
 
     private static void effect(ServerPlayerEntity p, RegistryEntry<StatusEffect> effect, int amplifier) {
         p.addStatusEffect(new StatusEffectInstance(effect, 60, amplifier, true, false, true));
     }
 
-    // ===== Синхронизация с клиентом (для кукольного HUD) =====
+    // ===== Синхронизация с клиентом =====
     public static void sync(ServerPlayerEntity p) {
         PlayerHealth h = health(p);
         StringBuilder sb = new StringBuilder();
@@ -362,7 +474,9 @@ public class Wounds {
                     | (s.isBleeding() ? 1 << 11 : 0);
             sb.append(code).append(',');
         }
-        sb.append(h.zombieInfected ? 1 : 0).append(',').append(h.painLeft > 0 ? 1 : 0);
+        sb.append(h.zombieInfected ? 1 : 0).append(',')
+          .append(h.painLeft > 0 ? 1 : 0).append(',')
+          .append(h.capPercent);
         ServerPlayNetworking.send(p, new WoundsPayload(sb.toString()));
     }
 
@@ -394,10 +508,11 @@ public class Wounds {
 
     public static void testWounds(ServerPlayerEntity p) {
         addWound(p, BodyPart.HEAD, WoundType.SCRATCH);
-        addWound(p, BodyPart.TORSO, WoundType.CUT);
-        addWound(p, BodyPart.LEFT_ARM, WoundType.DEEP);
-        addWound(p, BodyPart.RIGHT_ARM, WoundType.BURN);
-        addFracture(p, BodyPart.LEFT_LEG);
-        addWound(p, BodyPart.RIGHT_LEG, WoundType.CUT);
+        addWound(p, BodyPart.UPPER_TORSO, WoundType.CUT);
+        addWound(p, BodyPart.L_FOREARM, WoundType.DEEP);
+        addWound(p, BodyPart.R_UPPER_ARM, WoundType.BURN);
+        addFracture(p, BodyPart.L_SHIN);
+        addWound(p, BodyPart.R_THIGH, WoundType.CUT);
+        addWound(p, BodyPart.NECK, WoundType.SCRATCH);
     }
 }

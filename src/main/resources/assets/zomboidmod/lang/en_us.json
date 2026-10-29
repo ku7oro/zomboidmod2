@@ -5,5 +5,7 @@
   "item.zomboidmod.suture_kit": "Suture Kit",
   "item.zomboidmod.splint": "Splint",
   "item.zomboidmod.painkillers": "Painkillers",
-  "item.zomboidmod.antibiotics": "Antibiotics"
+  "item.zomboidmod.antibiotics": "Antibiotics",
+  "key.zomboidmod.health": "Health panel",
+  "category.zomboidmod": "Zomboid Survival"
 }

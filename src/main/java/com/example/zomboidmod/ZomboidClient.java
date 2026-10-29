@@ -3,54 +3,90 @@ package com.example.zomboidmod;
 import com.mojang.blaze3d.systems.RenderSystem;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.render.RenderTickCounter;
+import net.minecraft.client.util.InputUtil;
 import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
+import org.lwjgl.glfw.GLFW;
 
-/** Шкала жажды из капель, куколка с ранами и питьё из водоёма по Shift + ПКМ. */
+/** Жажда из капель, краткая сводка здоровья и клавиша панели здоровья (H). */
 public class ZomboidClient implements ClientModInitializer {
     private static final Identifier FULL = Identifier.of(ZomboidMod.MOD_ID, "textures/gui/drop_full.png");
     private static final Identifier HALF = Identifier.of(ZomboidMod.MOD_ID, "textures/gui/drop_half.png");
     private static final Identifier EMPTY = Identifier.of(ZomboidMod.MOD_ID, "textures/gui/drop_empty.png");
 
+    public static KeyBinding healthKey;
+
     private static int thirst = 100;
-    private static int[] codes = new int[6];
+    private static int[] codes = new int[BodyPart.values().length];
     private static boolean virus = false;
     private static boolean painkiller = false;
+    private static int capPercent = 100;
+
+    public static int[] codes() {
+        return codes;
+    }
+
+    public static boolean virus() {
+        return virus;
+    }
+
+    public static boolean painkiller() {
+        return painkiller;
+    }
+
+    public static int capPercent() {
+        return capPercent;
+    }
 
     @Override
     public void onInitializeClient() {
+        healthKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.zomboidmod.health", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_H, "category.zomboidmod"));
+
         ClientPlayNetworking.registerGlobalReceiver(ThirstPayload.ID,
                 (payload, context) -> thirst = payload.thirst());
         ClientPlayNetworking.registerGlobalReceiver(WoundsPayload.ID,
                 (payload, context) -> parseWounds(payload.data()));
         HudRenderCallback.EVENT.register(ZomboidClient::render);
-        ClientTickEvents.END_CLIENT_TICK.register(ZomboidClient::tickDrink);
+        ClientTickEvents.END_CLIENT_TICK.register(ZomboidClient::tick);
     }
 
     private static void parseWounds(String data) {
         try {
             String[] a = data.split(",");
-            int[] c = new int[6];
-            for (int i = 0; i < 6; i++) c[i] = Integer.parseInt(a[i].trim());
-            boolean v = a[6].trim().equals("1");
-            boolean pk = a[7].trim().equals("1");
+            int n = BodyPart.values().length;
+            int[] c = new int[n];
+            for (int i = 0; i < n; i++) c[i] = Integer.parseInt(a[i].trim());
+            boolean v = a[n].trim().equals("1");
+            boolean pk = a[n + 1].trim().equals("1");
+            int cap = Integer.parseInt(a[n + 2].trim());
             codes = c;
             virus = v;
             painkiller = pk;
+            capPercent = cap;
         } catch (Exception ignored) {
         }
     }
 
-    /** Shift + зажатая ПКМ с пустой рукой, глядя на воду: просим сервер дать попить. */
-    private static void tickDrink(MinecraftClient c) {
-        if (c.player == null || c.world == null || c.currentScreen != null) return;
+    private static void tick(MinecraftClient c) {
+        if (c.player == null || c.world == null) return;
+
+        // H открывает панель здоровья
+        while (healthKey.wasPressed()) {
+            if (c.currentScreen == null) c.setScreen(new HealthScreen());
+        }
+
+        // Shift + зажатая ПКМ с пустой рукой, глядя на воду: просим сервер дать попить
+        if (c.currentScreen != null) return;
         if (c.player.isCreative() || c.player.isSpectator()) return;
         if (!c.options.useKey.isPressed() || !c.player.isSneaking()) return;
         if (!c.player.getMainHandStack().isEmpty()) return;
@@ -68,15 +104,15 @@ public class ZomboidClient implements ClientModInitializer {
         if (c.player.isCreative() || c.player.isSpectator()) return;
 
         renderThirst(ctx, c);
-        renderWounds(ctx, c);
+        renderOverview(ctx, c);
     }
 
     // ===== Жажда =====
     private static void renderThirst(DrawContext ctx, MinecraftClient c) {
         int w = ctx.getScaledWindowWidth();
         int h = ctx.getScaledWindowHeight();
-        int y = h - 49;                                        // строка над шкалой голода
-        if (c.player.getAir() < c.player.getMaxAir()) y -= 10; // под водой пузырьки занимают эту строку
+        int y = h - 49;
+        if (c.player.getAir() < c.player.getMaxAir()) y -= 10;
 
         RenderSystem.enableBlend();
         for (int j = 0; j < 10; j++) {
@@ -88,74 +124,37 @@ public class ZomboidClient implements ClientModInitializer {
         RenderSystem.disableBlend();
     }
 
-    // ===== Куколка с ранами (слева сверху) =====
-    private static void renderWounds(DrawContext ctx, MinecraftClient c) {
-        boolean any = virus || painkiller;
-        for (int code : codes) {
-            if ((code & 15) != 0 || (code & (1 << 8)) != 0) any = true;
-        }
-        if (!any) return;
-
+    // ===== Краткая сводка здоровья вместо сердец (слева сверху) =====
+    private static void renderOverview(DrawContext ctx, MinecraftClient c) {
+        float pct = c.player.getHealth() / c.player.getMaxHealth() * 100f;
         int x = 8, y = 8;
-        // Куколка стоит лицом к нам: левая рука персонажа справа на экране
-        drawPart(ctx, codes[0], x + 8, y, x + 16, y + 8);            // голова
-        drawPart(ctx, codes[1], x + 6, y + 9, x + 18, y + 25);       // торс
-        drawPart(ctx, codes[3], x, y + 9, x + 5, y + 23);            // правая рука
-        drawPart(ctx, codes[2], x + 19, y + 9, x + 24, y + 23);      // левая рука
-        drawPart(ctx, codes[5], x + 6, y + 26, x + 11, y + 40);      // правая нога
-        drawPart(ctx, codes[4], x + 13, y + 26, x + 18, y + 40);     // левая нога
+        ctx.drawTextWithShadow(c.textRenderer,
+                "Здоровье: " + Math.round(pct) + "% (" + HealthScreen.statusOf(pct, capPercent) + ")",
+                x, y, HealthScreen.colorOf(pct));
+        int ty = y + 11;
 
-        // Подписи рядом
-        int ty = y;
-        for (int i = 0; i < 6; i++) {
-            int code = codes[i];
-            int type = code & 15;
-            boolean fracture = (code & (1 << 8)) != 0;
-            if (type == 0 && !fracture) continue;
-
-            StringBuilder sb = new StringBuilder(BodyPart.values()[i].title).append(": ");
-            if (type != 0) {
-                sb.append(WoundType.values()[type].title);
-                if ((code & (1 << 11)) != 0) sb.append(", кровь");
-                if ((code & (1 << 4)) != 0) sb.append((code & (1 << 5)) != 0 ? ", грязный бинт" : ", бинт");
-                if ((code & (1 << 6)) != 0) sb.append(", швы");
-                if ((code & (1 << 7)) != 0) sb.append(", инфекция");
-            }
-            if (fracture) sb.append(type != 0 ? "; " : "").append((code & (1 << 9)) != 0 ? "перелом (шина)" : "перелом");
-            ctx.drawTextWithShadow(c.textRenderer, sb.toString(), x + 30, ty, 0xFFFFFF);
+        boolean bleeding = false, infected = false;
+        for (int code : codes) {
+            if ((code & (1 << 11)) != 0) bleeding = true;
+            if ((code & (1 << 7)) != 0) infected = true;
+        }
+        if (bleeding) {
+            ctx.drawTextWithShadow(c.textRenderer, "Кровотечение!", x, ty, 0xFF5555);
+            ty += 10;
+        }
+        if (infected) {
+            ctx.drawTextWithShadow(c.textRenderer, "Инфекция в ране", x, ty, 0xA0FF30);
             ty += 10;
         }
         if (virus) {
-            ctx.drawTextWithShadow(c.textRenderer, "Заражение (укус)!", x + 30, ty, 0xCC55FF);
+            ctx.drawTextWithShadow(c.textRenderer, "Заражение (укус)!", x, ty, 0xCC55FF);
             ty += 10;
         }
         if (painkiller) {
-            ctx.drawTextWithShadow(c.textRenderer, "Обезболивающее действует", x + 30, ty, 0x55AAFF);
+            ctx.drawTextWithShadow(c.textRenderer, "Обезболивающее действует", x, ty, 0x55AAFF);
+            ty += 10;
         }
-    }
-
-    private static void drawPart(DrawContext ctx, int code, int x1, int y1, int x2, int y2) {
-        int type = code & 15;
-        int color = 0xFF3C8C50; // здорова
-        switch (type) {
-            case 1 -> color = 0xFFE6D83C; // царапина
-            case 2 -> color = 0xFFF0A030; // порез
-            case 3 -> color = 0xFFE03030; // глубокая рана
-            case 4 -> color = 0xFFA01818; // укус
-            case 5 -> color = 0xFFE07830; // ожог
-            default -> { }
-        }
-        if ((code & (1 << 8)) != 0) color = 0xFFB060E0; // перелом
-        ctx.fill(x1, y1, x2, y2, color);
-
-        if ((code & (1 << 4)) != 0) { // бинт: белая рамка (грязный - коричневая)
-            int bc = (code & (1 << 5)) != 0 ? 0xFFB08040 : 0xFFFFFFFF;
-            ctx.fill(x1, y1, x2, y1 + 1, bc);
-            ctx.fill(x1, y2 - 1, x2, y2, bc);
-            ctx.fill(x1, y1, x1 + 1, y2, bc);
-            ctx.fill(x2 - 1, y1, x2, y2, bc);
-        }
-        if ((code & (1 << 11)) != 0) ctx.fill(x2 - 3, y1 + 1, x2 - 1, y1 + 3, 0xFFFF2020); // кровь
-        if ((code & (1 << 7)) != 0) ctx.fill(x1 + 1, y1 + 1, x1 + 3, y1 + 3, 0xFFA0FF30);  // инфекция
+        ctx.drawTextWithShadow(c.textRenderer,
+                "[" + healthKey.getBoundKeyLocalizedText().getString() + "] панель здоровья", x, ty, 0x888888);
     }
 }

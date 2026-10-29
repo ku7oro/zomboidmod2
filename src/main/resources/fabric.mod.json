@@ -1,14 +1,15 @@
 {
   "schemaVersion": 1,
   "id": "zomboidmod",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "name": "Zomboid Survival",
-  "description": "Thirst system inspired by Project Zomboid.",
+  "description": "Project Zomboid-style survival: thirst, wounds, health panel.",
   "environment": "*",
   "entrypoints": {
     "main": ["com.example.zomboidmod.ZomboidMod"],
     "client": ["com.example.zomboidmod.ZomboidClient"]
   },
+  "mixins": ["zomboidmod.mixins.json"],
   "depends": {
     "fabricloader": ">=0.16.0",
     "minecraft": "~1.21.1",

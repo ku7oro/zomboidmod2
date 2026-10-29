@@ -4,6 +4,7 @@ import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.itemgroup.v1.ItemGroupEvents;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
@@ -31,6 +32,7 @@ import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.GameRules;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -41,12 +43,12 @@ public class ZomboidMod implements ModInitializer {
     public static final int MAX_THIRST = 100;
 
     // ===== Настройки жажды =====
-    private static final int SECONDS_PER_THIRST_POINT = 12;  // -1% жажды раз в 12 сек (бег - в 2 раза быстрее)
-    private static final int RIVER_DRINK_TICKS = 40;         // сколько держать ПКМ (2 сек = 1 глоток)
-    private static final int RIVER_DRINK_AMOUNT = 10;        // +% жажды за глоток из водоёма
-    private static final float RIVER_POISON_CHANCE = 0.30f;  // шанс отравления от водоёма
-    private static final int BOTTLE_DRINK_AMOUNT = 20;       // +% жажды от обычной бутылки с водой
-    private static final float BOTTLE_POISON_CHANCE = 0.15f; // шанс отравления от обычной бутылки
+    private static final int SECONDS_PER_THIRST_POINT = 12;
+    private static final int RIVER_DRINK_TICKS = 40;
+    private static final int RIVER_DRINK_AMOUNT = 10;
+    private static final float RIVER_POISON_CHANCE = 0.30f;
+    private static final int BOTTLE_DRINK_AMOUNT = 20;
+    private static final float BOTTLE_POISON_CHANCE = 0.15f;
 
     // Временные данные (не сохраняются)
     private static final Map<UUID, Integer> TIMER = new HashMap<>();
@@ -61,6 +63,17 @@ public class ZomboidMod implements ModInitializer {
     public static Item SPLINT;
     public static Item PAINKILLERS;
     public static Item ANTIBIOTICS;
+
+    public static Item itemFor(MedItem.Kind kind) {
+        return switch (kind) {
+            case BANDAGE -> BANDAGE;
+            case ANTISEPTIC -> ANTISEPTIC;
+            case SUTURE -> SUTURE_KIT;
+            case SPLINT -> SPLINT;
+            case PAINKILLERS -> PAINKILLERS;
+            case ANTIBIOTICS -> ANTIBIOTICS;
+        };
+    }
 
     public static int getThirst(ServerPlayerEntity p) {
         return ThirstState.get(p.getServer()).thirst.getOrDefault(p.getUuid(), MAX_THIRST);
@@ -109,10 +122,19 @@ public class ZomboidMod implements ModInitializer {
         PayloadTypeRegistry.playS2C().register(ThirstPayload.ID, ThirstPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(WoundsPayload.ID, WoundsPayload.CODEC);
         PayloadTypeRegistry.playC2S().register(DrinkPayload.ID, DrinkPayload.CODEC);
+        PayloadTypeRegistry.playC2S().register(TreatPayload.ID, TreatPayload.CODEC);
+
+        // Здоровье больше не восстанавливается само от сытости: только как в Project Zomboid
+        ServerLifecycleEvents.SERVER_STARTED.register(server ->
+                server.getGameRules().get(GameRules.NATURAL_REGENERATION).set(false, server));
 
         // Клиент просит попить из водоёма (Shift + ПКМ)
         ServerPlayNetworking.registerGlobalReceiver(DrinkPayload.ID,
                 (payload, context) -> requestRiverDrink(context.player(), context.server().getTicks()));
+
+        // Лечение из панели здоровья
+        ServerPlayNetworking.registerGlobalReceiver(TreatPayload.ID,
+                (payload, context) -> Wounds.treatFromMenu(context.player(), payload.part(), payload.action()));
 
         // Раны от урона
         ServerLivingEntityEvents.ALLOW_DAMAGE.register((entity, source, amount) -> {
@@ -145,14 +167,12 @@ public class ZomboidMod implements ModInitializer {
 
         // Команды
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
-            // Для всех: /wounds - список ран
             dispatcher.register(CommandManager.literal("wounds").executes(ctx -> {
                 ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
                 String text = Wounds.describe(p);
                 ctx.getSource().sendFeedback(() -> Text.literal(text), false);
                 return 1;
             }));
-            // Для оператора: /zomboid test (набор ран) и /zomboid heal (всё вылечить)
             dispatcher.register(CommandManager.literal("zomboid")
                     .requires(src -> src.hasPermissionLevel(2))
                     .then(CommandManager.literal("test").executes(ctx -> {
@@ -177,7 +197,7 @@ public class ZomboidMod implements ModInitializer {
             BOTTLE_LEFT.put(id, p.getItemUseTimeLeft());
         } else if (prev != null) {
             BOTTLE_LEFT.remove(id);
-            if (prev <= 1) { // допили до конца, а не отпустили раньше
+            if (prev <= 1) {
                 addThirst(p, BOTTLE_DRINK_AMOUNT);
                 maybePoison(p, BOTTLE_POISON_CHANCE);
             }
@@ -202,7 +222,7 @@ public class ZomboidMod implements ModInitializer {
             return;
         }
         Integer last = RIVER_LAST.get(id);
-        if (last == null || tick - last > 3) RIVER_PROGRESS.put(id, 0); // отпускали кнопку - начинаем заново
+        if (last == null || tick - last > 3) RIVER_PROGRESS.put(id, 0);
         RIVER_LAST.put(id, tick);
 
         int n = RIVER_PROGRESS.merge(id, 1, Integer::sum);
@@ -232,7 +252,7 @@ public class ZomboidMod implements ModInitializer {
         }
     }
 
-    // ===== Раз в секунду: жажда, её дебафы и раны =====
+    // ===== Раз в секунду: жажда, её дебафы и здоровье =====
     private static void everySecond(MinecraftServer server) {
         for (ServerPlayerEntity p : server.getPlayerManager().getPlayerList()) {
             if (!p.isAlive() || p.isCreative() || p.isSpectator()) continue;
@@ -245,7 +265,6 @@ public class ZomboidMod implements ModInitializer {
 
             int thirst = getThirst(p);
 
-            // Дебафы от потери жажды
             if (thirst <= 60) effect(p, StatusEffects.WEAKNESS, thirst <= 10 ? 1 : 0);
             if (thirst <= 40) effect(p, StatusEffects.MINING_FATIGUE, 0);
             if (thirst <= 25) effect(p, StatusEffects.SLOWNESS, thirst <= 10 ? 1 : 0);
