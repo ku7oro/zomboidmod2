@@ -2,15 +2,14 @@ package com.example.zomboidmod;
 
 import net.minecraft.nbt.NbtCompound;
 
-/** Состояние одной части тела. */
+/** Состояние одной части тела. Все «left» - в игровых часах PZ. */
 public class PartState {
     public int type;                 // порядковый номер WoundType
     public boolean bandaged, dirty, disinfected, stitched, infected;
     public boolean fracture, splinted;
-    public int bandageAge;           // секунд с наложения бинта
-    public int bleedLeft;            // -1 пока не вылечат, 0 не кровит
-    public int heal;                 // секунд до заживления
-    public int fractureHeal;         // секунд до сращения перелома (идёт только в шине)
+    public float healLeft;           // часов до заживления раны
+    public float fractureLeft;       // часов до сращения перелома
+    public float bandageLeft;        // часов до того, как бинт станет грязным
 
     public WoundType wound() {
         return WoundType.values()[type];
@@ -23,15 +22,15 @@ public class PartState {
         disinfected = false;
         stitched = false;
         infected = false;
-        bandageAge = 0;
-        bleedLeft = 0;
-        heal = 0;
+        healLeft = 0;
+        bandageLeft = 0;
     }
 
+    /** Кровит, пока не перевязана (глубокая рана - пока не зашита, под бинтом кровит слабее). */
     public boolean isBleeding() {
         WoundType t = wound();
-        if (t.bleedSeconds == 0 || bleedLeft == 0 || stitched) return false;
-        if (bandaged && t != WoundType.DEEP) return false; // глубокая рана кровит под бинтом, пока не зашита
+        if (!t.bleeds || stitched) return false;
+        if (bandaged && t != WoundType.DEEP) return false;
         return true;
     }
 
@@ -49,10 +48,9 @@ public class PartState {
         n.putBoolean("infected", infected);
         n.putBoolean("fracture", fracture);
         n.putBoolean("splinted", splinted);
-        n.putInt("bandageAge", bandageAge);
-        n.putInt("bleedLeft", bleedLeft);
-        n.putInt("heal", heal);
-        n.putInt("fractureHeal", fractureHeal);
+        n.putFloat("healLeft", healLeft);
+        n.putFloat("fractureLeft", fractureLeft);
+        n.putFloat("bandageLeft", bandageLeft);
         return n;
     }
 
@@ -66,10 +64,9 @@ public class PartState {
         s.infected = n.getBoolean("infected");
         s.fracture = n.getBoolean("fracture");
         s.splinted = n.getBoolean("splinted");
-        s.bandageAge = n.getInt("bandageAge");
-        s.bleedLeft = n.getInt("bleedLeft");
-        s.heal = n.getInt("heal");
-        s.fractureHeal = n.getInt("fractureHeal");
+        s.healLeft = n.getFloat("healLeft");
+        s.fractureLeft = n.getFloat("fractureLeft");
+        s.bandageLeft = n.getFloat("bandageLeft");
         return s;
     }
 }

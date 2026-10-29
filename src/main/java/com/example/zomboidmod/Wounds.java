@@ -8,7 +8,9 @@ import net.minecraft.entity.effect.StatusEffect;
 import net.minecraft.entity.effect.StatusEffectInstance;
 import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.entity.mob.ZombieEntity;
+import net.minecraft.entity.passive.IronGolemEntity;
 import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.AxeItem;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.entry.RegistryEntry;
@@ -17,25 +19,24 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
+import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.math.random.Random;
 
-import java.util.function.Predicate;
+import java.util.function.BiPredicate;
 
-/** Здоровье в духе Project Zomboid: 17 частей тела, раны, перелом, инфекция, лечение. */
+/**
+ * Здоровье в духе Project Zomboid (по pzwiki.net: Health, First Aid, Injured, Pain).
+ * Времена заживления даны в игровых часах PZ; 1 час PZ = hourSeconds реальных секунд
+ * (в PZ по умолчанию 1 игровой день = 1 реальный час, то есть 150 секунд на час).
+ * Остальные числа (боль, штрафы, скорости кровотечения) - оценки: в вики их нет.
+ */
 public class Wounds {
-    // ===== Настройки (в секундах) =====
-    private static final int BANDAGE_DIRTY_AFTER = 300;
-    private static final int FRACTURE_HEAL = 1800;
-    private static final int PAINKILLER_TIME = 300;
+    /** 1 игровой час PZ в секундах. Менять командой /zomboid hour <секунды> (для проверки). */
+    public static volatile int hourSeconds = 150;
 
-    // Вирус зомби
-    private static final int VIRUS_WEAK_AT = 180;
-    private static final int VIRUS_SICK_AT = 360;
-    private static final int VIRUS_DEATH_AT = 600;
-
-    // Восстановление здоровья (HP в секунду; всего 20 HP)
-    private static final double REGEN_BASE = 0.02;
-    private static final double REGEN_SLEEP_MULT = 5.0;
+    private static final float BANDAGE_LIFE_HOURS = 10f;
+    private static final float PAINKILLER_HOURS = 2f;
+    private static final float ANTIBIOTIC_HOURS = 6f;
 
     private static final int TOTAL_WEIGHT;
 
@@ -68,25 +69,51 @@ public class Wounds {
 
         if (source.isIn(DamageTypeTags.IS_FALL)) {
             BodyPart leg = randomLeg(r);
-            if (amount >= 5.0f && r.nextFloat() < 0.35f) addFracture(p, leg);
-            else if (amount >= 3.0f) addWound(p, leg, WoundType.CUT);
+            if (amount >= 9.0f && r.nextFloat() < 0.2f) addFracture(p, BodyPart.UPPER_TORSO);
+            else if (amount >= 5.0f && r.nextFloat() < 0.4f) addFracture(p, leg);
+            else if (amount >= 3.0f) addWound(p, leg, r.nextFloat() < 0.3f ? WoundType.DEEP : WoundType.CUT);
             else addWound(p, leg, WoundType.SCRATCH);
         } else if (source.isIn(DamageTypeTags.IS_FIRE)) {
             if (r.nextFloat() < 0.3f) addWound(p, randomPart(r), WoundType.BURN);
         } else if (source.isIn(DamageTypeTags.IS_PROJECTILE)) {
             addWound(p, randomPart(r), amount >= 5.0f ? WoundType.DEEP : WoundType.CUT);
         } else if (attacker instanceof ZombieEntity) {
-            float roll = r.nextFloat();
-            WoundType type = roll < 0.25f ? WoundType.BITE : (roll < 0.55f ? WoundType.CUT : WoundType.SCRATCH);
-            addWound(p, randomPart(r), type);
-            float virus = type == WoundType.BITE ? 1.0f : (type == WoundType.CUT ? 0.25f : 0.07f);
-            if (r.nextFloat() < virus) infectZombie(p);
-        } else if (attacker instanceof LivingEntity) {
-            if (r.nextFloat() < 0.6f) {
+            zombieHit(p, attacker, r);
+        } else if (attacker instanceof IronGolemEntity && r.nextFloat() < 0.25f) {
+            BodyPart limb = r.nextBoolean() ? randomLeg(r) : randomArm(r);
+            addFracture(p, limb); // удар тупым предметом
+        } else if (attacker instanceof LivingEntity living) {
+            if (living.getMainHandStack().getItem() instanceof AxeItem) {
+                addWound(p, randomPart(r), WoundType.DEEP); // удар топором
+            } else if (r.nextFloat() < 0.6f) {
                 addWound(p, randomPart(r),
                         amount >= 6.0f ? WoundType.DEEP : (amount >= 3.0f ? WoundType.CUT : WoundType.SCRATCH));
             }
         }
+    }
+
+    /** Шансы по pzwiki: спереди царапина 57% / рваная 29% / укус 14%; сбоку 31/48/21; сзади укусов больше. */
+    private static void zombieHit(ServerPlayerEntity p, Entity zombie, Random r) {
+        int side = facing(p, zombie); // 0 спереди, 1 сбоку, 2 сзади
+        float scratch = side == 0 ? 0.57f : (side == 1 ? 0.31f : 0.25f);
+        float cut = side == 0 ? 0.29f : (side == 1 ? 0.48f : 0.40f);
+        float roll = r.nextFloat();
+        WoundType type = roll < scratch ? WoundType.SCRATCH : (roll < scratch + cut ? WoundType.CUT : WoundType.BITE);
+        addWound(p, randomPart(r), type);
+        // Вирус Нокс: царапина 7%, рваная рана 25%, укус 100%
+        float virus = type == WoundType.BITE ? 1.0f : (type == WoundType.CUT ? 0.25f : 0.07f);
+        if (r.nextFloat() < virus) infectZombie(p);
+    }
+
+    private static int facing(ServerPlayerEntity p, Entity attacker) {
+        double dx = attacker.getX() - p.getX();
+        double dz = attacker.getZ() - p.getZ();
+        double len = Math.sqrt(dx * dx + dz * dz);
+        Vec3d look = p.getRotationVec(1.0f);
+        double llen = Math.sqrt(look.x * look.x + look.z * look.z);
+        if (len < 1.0E-4 || llen < 1.0E-4) return 1;
+        double dot = (look.x * dx + look.z * dz) / (len * llen);
+        return dot > 0.5 ? 0 : (dot < -0.5 ? 2 : 1);
     }
 
     private static BodyPart randomPart(Random r) {
@@ -104,16 +131,19 @@ public class Wounds {
         return legs[r.nextInt(legs.length)];
     }
 
+    private static BodyPart randomArm(Random r) {
+        BodyPart[] arms = {BodyPart.L_UPPER_ARM, BodyPart.R_UPPER_ARM, BodyPart.L_FOREARM, BodyPart.R_FOREARM,
+                BodyPart.L_HAND, BodyPart.R_HAND};
+        return arms[r.nextInt(arms.length)];
+    }
+
     public static void addWound(ServerPlayerEntity p, BodyPart part, WoundType type) {
         PartState s = health(p).parts[part.ordinal()];
         WoundType cur = s.wound();
         if (cur != WoundType.NONE && cur.rank >= type.rank) return; // уже есть не слабее
         s.clearWound();
         s.type = type.ordinal();
-        s.bleedLeft = type.bleedSeconds;
-        s.heal = type.healSeconds;
-        // Раны на шее кровоточат, пока их не перевяжут
-        if (part == BodyPart.NECK && type.bleedSeconds != 0) s.bleedLeft = -1;
+        s.healLeft = type.rollHours(p.getRandom());
         p.sendMessage(Text.literal("Рана: " + type.title + " (" + part.title.toLowerCase() + ")"), true);
         markDirty(p);
         sync(p);
@@ -125,7 +155,7 @@ public class Wounds {
         if (s.fracture) return;
         s.fracture = true;
         s.splinted = false;
-        s.fractureHeal = FRACTURE_HEAL;
+        s.fractureLeft = 50f + p.getRandom().nextFloat() * 30f; // 50-80 часов
         p.sendMessage(Text.literal("Перелом! (" + part.title.toLowerCase() + ")"), true);
         markDirty(p);
         sync(p);
@@ -135,7 +165,8 @@ public class Wounds {
         PlayerHealth h = health(p);
         if (h.zombieInfected) return;
         h.zombieInfected = true;
-        h.zombieTimer = 0;
+        h.zombieHours = 0;
+        h.zombieDeathAt = 60f + p.getRandom().nextInt(25); // в среднем 3 суток (72 часа)
         markDirty(p);
         sync(p);
     }
@@ -147,10 +178,10 @@ public class Wounds {
         PlayerHealth h = health(p);
         int idx;
         switch (kind) {
-            case BANDAGE -> idx = pick(h, s -> s.type != 0 && (!s.bandaged || s.dirty));
-            case ANTISEPTIC -> idx = pick(h, s -> s.type != 0 && !s.disinfected);
-            case SUTURE -> idx = pick(h, s -> s.wound() == WoundType.DEEP && !s.stitched);
-            case SPLINT -> idx = pick(h, s -> s.fracture && !s.splinted);
+            case BANDAGE -> idx = pick(h, (i, s) -> s.type != 0 && (!s.bandaged || s.dirty));
+            case ANTISEPTIC -> idx = pick(h, (i, s) -> s.type != 0 && !s.disinfected);
+            case SUTURE -> idx = pick(h, (i, s) -> s.wound() == WoundType.DEEP && !s.stitched);
+            case SPLINT -> idx = pick(h, (i, s) -> s.fracture && !s.splinted && BodyPart.values()[i].canSplint());
             default -> idx = 0;
         }
         if (idx < 0) return fail(p, noTarget(kind));
@@ -162,8 +193,16 @@ public class Wounds {
             case BANDAGE -> "Нечего перевязывать";
             case ANTISEPTIC -> "Нечего обрабатывать";
             case SUTURE -> "Зашивать нечего (нужна глубокая рана)";
-            case SPLINT -> "Нет перелома без шины";
+            case SPLINT -> "Нет перелома, который можно зашинировать";
             default -> "Не подходит";
+        };
+    }
+
+    private static float bandageLife(WoundType t) {
+        return switch (t) {
+            case DEEP -> BANDAGE_LIFE_HOURS / 2f;
+            case BITE, BURN -> BANDAGE_LIFE_HOURS * 0.6f;
+            default -> BANDAGE_LIFE_HOURS;
         };
     }
 
@@ -171,14 +210,15 @@ public class Wounds {
     public static boolean treatPart(ServerPlayerEntity p, MedItem.Kind kind, int idx) {
         PlayerHealth h = health(p);
         PartState s = h.parts[idx];
-        String name = BodyPart.values()[idx].title.toLowerCase();
+        BodyPart part = BodyPart.values()[idx];
+        String name = part.title.toLowerCase();
         switch (kind) {
             case BANDAGE -> {
                 if (s.type == 0) return fail(p, "На этой части тела нет раны");
                 if (s.bandaged && !s.dirty) return fail(p, "Рана уже перевязана");
                 s.bandaged = true;
                 s.dirty = false;
-                s.bandageAge = 0;
+                s.bandageLeft = bandageLife(s.wound());
                 done(p, "Бинт наложен: " + name);
                 return true;
             }
@@ -192,32 +232,26 @@ public class Wounds {
             case SUTURE -> {
                 if (s.wound() != WoundType.DEEP) return fail(p, "Зашивать можно только глубокую рану");
                 if (s.stitched) return fail(p, "Рана уже зашита");
-                s.stitched = true;
+                s.stitched = true; // шов закрывает рану сразу и останавливает кровь
                 done(p, "Швы наложены: " + name);
                 return true;
             }
             case SPLINT -> {
                 if (!s.fracture) return fail(p, "Здесь нет перелома");
+                if (!part.canSplint()) return fail(p, "Перелом торса и головы шиной не зафиксировать");
                 if (s.splinted) return fail(p, "Шина уже наложена");
                 s.splinted = true;
                 done(p, "Шина наложена: " + name);
                 return true;
             }
             case PAINKILLERS -> {
-                h.painLeft = PAINKILLER_TIME;
+                h.painLeft = PAINKILLER_HOURS;
                 done(p, "Боль утихла");
                 return true;
             }
             case ANTIBIOTICS -> {
-                boolean any = false;
-                for (PartState ps : h.parts) {
-                    if (ps.infected) {
-                        ps.infected = false;
-                        any = true;
-                    }
-                }
-                if (!any) return fail(p, "Инфекции в ранах нет");
-                done(p, "Инфекция в ранах побеждена");
+                h.antibioticLeft = ANTIBIOTIC_HOURS;
+                done(p, "Антибиотики приняты: инфекция в ранах отступит (вирус Нокс они не лечат)");
                 return true;
             }
         }
@@ -255,12 +289,12 @@ public class Wounds {
         return false;
     }
 
-    /** Самая срочная подходящая часть тела: сначала кровоточащие, потом по тяжести. */
-    private static int pick(PlayerHealth h, Predicate<PartState> filter) {
+    /** Самая срочная подходящая часть тела: сначала кровоточащие, потом по тяжести, шея в приоритете. */
+    private static int pick(PlayerHealth h, BiPredicate<Integer, PartState> filter) {
         int best = -1, bestScore = -1;
         for (int i = 0; i < h.parts.length; i++) {
             PartState s = h.parts[i];
-            if (!filter.test(s)) continue;
+            if (!filter.test(i, s)) continue;
             int score = (s.isBleeding() ? 100 : 0) + s.wound().rank * 10 + (s.fracture ? 5 : 0)
                     + (i == BodyPart.NECK.ordinal() ? 50 : 0);
             if (score > bestScore) {
@@ -282,176 +316,256 @@ public class Wounds {
         sync(p);
     }
 
-    // ===== Раз в секунду =====
-    public static void tickSecond(ServerPlayerEntity p, int serverTicks) {
-        PlayerHealth h = health(p);
-        int sec = serverTicks / 20;
-        boolean suppressed = h.painLeft > 0;
-        if (h.painLeft > 0) h.painLeft--;
+    // ===== Время =====
 
-        double bleed = 0;
-        int legPain = 0, armPain = 0, headPain = 0, torsoPain = 0;
-        boolean legFracture = false, armFracture = false, anyInfected = false;
-        int penalty = 0;
+    /** Раз в секунду. */
+    public static void tickSecond(ServerPlayerEntity p, int serverTicks) {
+        step(p, serverTicks, 1.0 / hourSeconds, false);
+    }
+
+    /** После сна: проматываем прошедшие игровые часы одним шагом (сон ускоряет выздоровление). */
+    public static void advanceSleep(ServerPlayerEntity p, double hours) {
+        step(p, p.getServer().getTicks(), Math.min(hours, 12.0), true);
+    }
+
+    /** Потеря здоровья в % от максимума. Смерть наступает при нуле. */
+    private static void drain(ServerPlayerEntity p, double percent) {
+        if (percent <= 0) return;
+        float hp = p.getHealth() - (float) (p.getMaxHealth() * percent / 100.0);
+        if (hp <= 0.05f) p.damage(p.getDamageSources().generic(), Float.MAX_VALUE);
+        else p.setHealth(hp);
+    }
+
+    private static void step(ServerPlayerEntity p, int serverTicks, double dtHours, boolean sleeping) {
+        PlayerHealth h = health(p);
         Random r = p.getRandom();
+        double seconds = dtHours * hourSeconds;
+        int sec = serverTicks / 20;
+
+        int thirst = ZomboidMod.getThirst(p);
+        int food = p.getHungerManager().getFoodLevel();
+        boolean wellFed = food >= 16 && thirst >= 60;
+        boolean starving = food < 6 || thirst < 20;
+
+        h.painLeft = Math.max(0f, h.painLeft - (float) dtHours);
+        h.antibioticLeft = Math.max(0f, h.antibioticLeft - (float) dtHours);
+
+        double bleedPct = 0;     // потеря здоровья от кровотечения, % в секунду
+        double drainPct = 0;     // прочая постоянная потеря, % в секунду
+        double[] groupPain = new double[BodyGroup.values().length];
+        int penalty = 0;
+        boolean legFracUns = false, legFracSpl = false, armFracUns = false, armFracSpl = false, torsoFrac = false;
 
         for (int i = 0; i < h.parts.length; i++) {
             PartState s = h.parts[i];
             BodyPart part = BodyPart.values()[i];
             WoundType t = s.wound();
+            double pain = 0;
 
             if (t != WoundType.NONE) {
-                // бинт пачкается со временем
+                // бинт со временем становится грязным
                 if (s.bandaged && !s.dirty) {
-                    s.bandageAge++;
-                    if (s.bandageAge >= BANDAGE_DIRTY_AFTER) {
+                    s.bandageLeft -= (float) dtHours;
+                    if (s.bandageLeft <= 0) {
                         s.dirty = true;
-                        p.sendMessage(Text.literal("Бинт испачкался: " + part.title.toLowerCase()), false);
+                        p.sendMessage(Text.literal("Бинт испачкался, замените: " + part.title.toLowerCase()), false);
                     }
                 }
 
-                // кровотечение
-                if (s.bleedLeft > 0) s.bleedLeft--;
-                if (s.isBleeding()) bleed += bleedRate(s, t, part);
+                // кровотечение (рана на шее кровит в разы сильнее)
+                if (s.isBleeding()) {
+                    double rate = t.bleedPerSecond();
+                    if (t == WoundType.DEEP && s.bandaged) rate *= 0.5;
+                    if (part == BodyPart.NECK) rate *= 10.0;
+                    bleedPct += rate;
+                }
+                // глубокая рана без швов выматывает даже когда кровь остановлена
+                if (t == WoundType.DEEP && !s.stitched) drainPct += 0.03;
 
                 // заражение раны
-                if (!s.infected && sec % 30 == 0 && !(s.bandaged && !s.dirty)) {
-                    float chance = s.disinfected ? 0.01f : 0.04f;
-                    if (t == WoundType.DEEP || t == WoundType.BITE) chance *= 2;
-                    if (r.nextFloat() < chance) {
+                if (!s.infected && h.antibioticLeft <= 0f) {
+                    double perHour = !s.bandaged ? 0.03 : (s.dirty ? 0.05 : 0.003);
+                    if (s.disinfected) perHour *= 0.2;
+                    if (t == WoundType.DEEP || t == WoundType.BITE) perHour *= 1.5;
+                    if (r.nextDouble() < Math.min(1.0, perHour * dtHours)) {
                         s.infected = true;
-                        p.sendMessage(Text.literal("Рана заражена: " + part.title.toLowerCase()
-                                + " (нужны антибиотики)"), false);
+                        p.sendMessage(Text.literal("Рана заражена: " + part.title.toLowerCase()), false);
+                    }
+                }
+                if (s.infected) {
+                    if (!s.bandaged || s.dirty) drainPct += 0.01; // совсем небольшая потеря здоровья
+                    if (h.antibioticLeft > 0f && r.nextDouble() < Math.min(1.0, dtHours / 3.0)) {
+                        s.infected = false;
+                        p.sendMessage(Text.literal("Инфекция в ране отступила: " + part.title.toLowerCase()), false);
                     }
                 }
 
                 // заживление
-                if (s.infected) {
-                    anyInfected = true;
+                double rate;
+                if (t == WoundType.DEEP) {
+                    if (s.stitched) rate = s.bandaged ? 2.0 : 1.0;   // бинт сокращает срок вдвое
+                    else rate = s.bandaged ? 0.025 : 0.01;           // без швов: около месяца
                 } else {
-                    int step = (s.bandaged && !s.dirty) ? 2 : 1;
-                    if (t == WoundType.DEEP && !s.stitched) step = (sec % 4 == 0) ? 1 : 0;
-                    s.heal -= step;
-                    if (s.heal <= 0) {
-                        s.clearWound();
-                        p.sendMessage(Text.literal("Рана зажила: " + part.title.toLowerCase()), false);
-                    }
+                    rate = s.bandaged ? 1.0 : 0.25;
+                }
+                if (s.infected) rate *= 0.5;
+                if (wellFed) rate *= 1.3;
+                s.healLeft -= (float) (rate * dtHours);
+                if (s.healLeft <= 0f) {
+                    p.sendMessage(Text.literal("Рана зажила: " + part.title.toLowerCase()), false);
+                    s.clearWound();
+                    t = WoundType.NONE;
                 }
             }
 
-            int rank = s.wound().rank;
-            int pain = rank;
-            penalty += rank * (part == BodyPart.NECK ? 4 : 2);
-            if (s.infected) penalty += 8;
+            if (t != WoundType.NONE) {
+                pain += t.pain;
+                if (t == WoundType.DEEP && s.stitched) pain *= 0.5;
+                if (s.bandaged) pain *= 0.6; // повязка уменьшает боль
+                if (s.infected) pain *= s.bandaged ? 1.3 : 2.0; // непролеченная инфекция удваивает боль
+                penalty += t.capPenalty;
+            }
 
             // перелом
             if (s.fracture) {
-                if (s.splinted) {
-                    s.fractureHeal--;
-                    if (s.fractureHeal <= 0) {
-                        s.fracture = false;
-                        s.splinted = false;
-                        p.sendMessage(Text.literal("Перелом срёсся: " + part.title.toLowerCase()), false);
+                double fr = s.splinted ? 1.0 : 0.5;
+                if (wellFed) fr *= 1.3;
+                s.fractureLeft -= (float) (fr * dtHours);
+                if (s.fractureLeft <= 0f) {
+                    s.fracture = false;
+                    s.splinted = false;
+                    p.sendMessage(Text.literal("Перелом сросся: " + part.title.toLowerCase()), false);
+                } else {
+                    if (part == BodyPart.UPPER_TORSO) {
+                        pain += 45;
+                        penalty += 40; // перелом верхней части туловища держит максимум здоровья около 60%
+                        torsoFrac = true;
+                    } else {
+                        pain += s.splinted ? 18 : 40;
+                        penalty += s.splinted ? 10 : 15;
+                        if (part.isLeg()) {
+                            if (s.splinted) legFracSpl = true; else legFracUns = true;
+                        } else if (part.isArm()) {
+                            if (s.splinted) armFracSpl = true; else armFracUns = true;
+                        }
                     }
                 }
-                pain += s.splinted ? 2 : 4;
-                penalty += s.splinted ? 8 : 12;
-                if (!s.splinted) {
-                    if (part.isLeg()) legFracture = true;
-                    if (part.isArm()) armFracture = true;
-                }
             }
 
-            switch (part.group) {
-                case LEG -> legPain += pain;
-                case ARM -> armPain += pain;
-                case HEAD -> headPain += pain;
-                case TORSO -> torsoPain += pain;
-            }
+            groupPain[part.group.ordinal()] += pain;
         }
 
-        // максимум здоровья ограничен травмами
+        // Боль: общая сумма, обезболивающее вычитает 35 пунктов
+        double sumPain = 0;
+        for (double g : groupPain) sumPain += g;
+        double factor = 1.0;
+        if (h.painLeft > 0f && sumPain > 0) factor = Math.max(0.0, (sumPain - 35.0) / sumPain);
+        for (int g = 0; g < groupPain.length; g++) groupPain[g] *= factor;
+        h.painValue = (int) Math.round(Math.min(100.0, sumPain * factor));
+
+        // Уровень кровотечения
+        h.bleedLevel = bleedPct >= 0.4 ? 3 : (bleedPct >= 0.15 ? 2 : (bleedPct > 0 ? 1 : 0));
+
+        // Максимум здоровья из-за травм (шея ограничение игнорирует: её кровь выедает здоровье напрямую)
         h.capPercent = Math.max(20, 100 - penalty);
-        float capHp = p.getMaxHealth() * h.capPercent / 100f;
-        if (p.getHealth() > capHp) p.setHealth(capHp);
-
-        // кровопотеря
-        h.bleedAcc += bleed;
-        if (h.bleedAcc >= 1.0) {
-            h.bleedAcc -= 1.0;
-            p.damage(p.getDamageSources().generic(), 1.0f);
+        float maxHp = p.getMaxHealth();
+        float capHp = maxHp * h.capPercent / 100f;
+        if (p.getHealth() > capHp) {
+            p.setHealth(Math.max(capHp, p.getHealth() - maxHp * 0.0003f * (float) seconds));
         }
 
-        // инфекция в ранах
-        if (anyInfected) {
-            effect(p, StatusEffects.WEAKNESS, 1);
-            if (sec % 20 == 0) p.damage(p.getDamageSources().generic(), 1.0f);
-            if (sec % 40 == 0) {
-                p.addStatusEffect(new StatusEffectInstance(StatusEffects.NAUSEA, 100, 0, true, false, false));
-            }
+        // Вирус Нокс
+        double knoxHours = 0;
+        if (h.zombieInfected) {
+            h.zombieHours += (float) dtHours;
+            knoxHours = h.zombieHours;
+            if (knoxHours >= 24) drain(p, 0.0004 * (knoxHours - 24) * seconds); // потеря здоровья всё быстрее
         }
 
-        // боль (обезболивающее её глушит, но не неподвижный перелом)
-        if (legFracture) effect(p, StatusEffects.SLOWNESS, 2);
-        else if (!suppressed) {
-            if (legPain >= 3) effect(p, StatusEffects.SLOWNESS, 1);
-            else if (legPain >= 1) effect(p, StatusEffects.SLOWNESS, 0);
+        // Потери здоровья от ран
+        drain(p, (bleedPct + drainPct) * seconds);
+
+        // ===== Дебафы =====
+        double hpPct = p.getHealth() / maxHp * 100.0;
+        int slow = -1, weak = -1, miningFatigue = -1;
+
+        // Ноги: боль и переломы замедляют
+        double leg = groupPain[BodyGroup.LEG.ordinal()];
+        if (legFracUns) slow = 3;
+        else if (legFracSpl) slow = 1;
+        if (leg >= 75) slow = Math.max(slow, 2);
+        else if (leg >= 50) slow = Math.max(slow, 1);
+        else if (leg >= 20) slow = Math.max(slow, 0);
+
+        // Руки: боль и переломы снижают скорость и силу ударов
+        double arm = groupPain[BodyGroup.ARM.ordinal()];
+        if (armFracUns) {
+            miningFatigue = 2;
+            weak = Math.max(weak, 1);
+        } else if (armFracSpl) {
+            miningFatigue = 0;
         }
-        if (armFracture) {
-            effect(p, StatusEffects.MINING_FATIGUE, 1);
-            effect(p, StatusEffects.WEAKNESS, 0);
-        } else if (!suppressed) {
-            if (armPain >= 3) {
-                effect(p, StatusEffects.MINING_FATIGUE, 1);
-                effect(p, StatusEffects.WEAKNESS, 0);
-            } else if (armPain >= 1) {
-                effect(p, StatusEffects.MINING_FATIGUE, 0);
-            }
+        if (arm >= 75) {
+            miningFatigue = Math.max(miningFatigue, 1);
+            weak = Math.max(weak, 1);
+        } else if (arm >= 50) {
+            miningFatigue = Math.max(miningFatigue, 0);
+            weak = Math.max(weak, 0);
+        } else if (arm >= 20) {
+            miningFatigue = Math.max(miningFatigue, 0);
         }
-        if (!suppressed && headPain >= 2 && sec % 20 == 0) {
+
+        // Торс: выносливость
+        double torso = groupPain[BodyGroup.TORSO.ordinal()];
+        if (torsoFrac) weak = Math.max(weak, 0);
+        if (torso >= 75) weak = Math.max(weak, 1);
+        else if (torso >= 50) weak = Math.max(weak, 0);
+
+        // Голова: тошнота при сильной боли
+        double head = groupPain[BodyGroup.HEAD.ordinal()];
+        if (head >= 50 && sec % 30 == 0) {
             p.addStatusEffect(new StatusEffectInstance(StatusEffects.NAUSEA, 60, 0, true, false, false));
         }
-        if (!suppressed && torsoPain >= 2) effect(p, StatusEffects.WEAKNESS, 0);
 
-        // восстановление здоровья: нужны покой, еда и вода; сон ускоряет
-        int thirst = ZomboidMod.getThirst(p);
-        int food = p.getHungerManager().getFoodLevel();
-        boolean canHeal = bleed == 0 && !anyInfected && !h.zombieInfected && thirst >= 20 && food >= 6;
+        // Моодл "Травмирован": по общему здоровью (<60 / <40 / <25)
+        if (hpPct < 40) weak = Math.max(weak, 1);
+        else if (hpPct < 60) weak = Math.max(weak, 0);
+        if (hpPct < 25) slow = Math.max(slow, 0);
+
+        // Моодл "Кровотечение": со 2 уровня сила падает
+        if (h.bleedLevel == 3) weak = Math.max(weak, 1);
+        else if (h.bleedLevel == 2) weak = Math.max(weak, 0);
+
+        // Вирус Нокс: через сутки болезнь, на 2-е сутки сильнее
+        if (knoxHours >= 48) weak = Math.max(weak, 1);
+        else if (knoxHours >= 24) weak = Math.max(weak, 0);
+        if (knoxHours >= 24 && sec % 15 == 0) {
+            p.addStatusEffect(new StatusEffectInstance(StatusEffects.NAUSEA, 100, 0, true, false, false));
+        }
+
+        if (slow >= 0) effect(p, StatusEffects.SLOWNESS, slow);
+        if (weak >= 0) effect(p, StatusEffects.WEAKNESS, weak);
+        if (miningFatigue >= 0) effect(p, StatusEffects.MINING_FATIGUE, miningFatigue);
+
+        // ===== Восстановление здоровья =====
+        boolean canHeal = bleedPct == 0 && knoxHours < 24 && !starving;
         if (canHeal && p.getHealth() < capHp) {
-            double rate = REGEN_BASE;
-            if (thirst >= 60) rate *= 1.25;
-            if (food >= 16) rate *= 1.5;
-            if (p.isSleeping()) rate *= REGEN_SLEEP_MULT;
-            p.setHealth(Math.min(capHp, p.getHealth() + (float) rate));
+            double pct = 2.0; // % максимума за игровой час
+            if (wellFed) pct *= 1.3;
+            if (food < 12 || thirst < 40) pct *= 0.5;
+            double now = p.getHealth() / maxHp * 100.0;
+            if (now < 10 || now > 80) pct *= 0.5; // быстрее всего между 10% и 80%
+            if (sleeping) pct *= 3.0;
+            p.setHealth(Math.min(capHp, p.getHealth() + (float) (maxHp * pct / 100.0 * dtHours)));
         }
 
-        // вирус зомби
-        if (h.zombieInfected) {
-            h.zombieTimer++;
-            if (h.zombieTimer >= VIRUS_WEAK_AT) effect(p, StatusEffects.WEAKNESS, 0);
-            if (h.zombieTimer >= VIRUS_SICK_AT) {
-                p.addStatusEffect(new StatusEffectInstance(StatusEffects.NAUSEA, 100, 0, true, false, false));
-                if (h.zombieTimer % 10 == 0) p.damage(p.getDamageSources().generic(), 1.0f);
-            }
-            if (h.zombieTimer >= VIRUS_DEATH_AT) {
-                p.damage(p.getDamageSources().generic(), Float.MAX_VALUE);
-            }
+        // Смерть от вируса Нокс
+        if (h.zombieInfected && h.zombieHours >= h.zombieDeathAt) {
+            p.damage(p.getDamageSources().generic(), Float.MAX_VALUE);
         }
 
+        markDirty(p);
         sync(p);
-    }
-
-    private static double bleedRate(PartState s, WoundType t, BodyPart part) {
-        double base = switch (t) {
-            case SCRATCH -> 0.05;
-            case CUT -> 0.10;
-            case DEEP -> s.bandaged ? 0.12 : 0.25;
-            case BITE -> 0.15;
-            default -> 0.0;
-        };
-        // Раны на шее особенно опасны: быстро истощают здоровье, пока не перевязаны
-        if (part == BodyPart.NECK) base *= 3.0;
-        return base;
     }
 
     private static void effect(ServerPlayerEntity p, RegistryEntry<StatusEffect> effect, int amplifier) {
@@ -475,8 +589,10 @@ public class Wounds {
             sb.append(code).append(',');
         }
         sb.append(h.zombieInfected ? 1 : 0).append(',')
-          .append(h.painLeft > 0 ? 1 : 0).append(',')
-          .append(h.capPercent);
+          .append(h.painLeft > 0f ? 1 : 0).append(',')
+          .append(h.capPercent).append(',')
+          .append(h.painValue).append(',')
+          .append(h.bleedLevel);
         ServerPlayNetworking.send(p, new WoundsPayload(sb.toString()));
     }
 
@@ -502,7 +618,7 @@ public class Wounds {
         }
         if (!any) sb.append("\nРан нет");
         if (h.zombieInfected) sb.append("\nЗаражение вирусом: да");
-        if (h.painLeft > 0) sb.append("\nОбезболивающее действует ещё ").append(h.painLeft).append(" сек");
+        if (h.painLeft > 0f) sb.append("\nОбезболивающее действует ещё ").append(Math.round(h.painLeft * 10) / 10.0).append(" ч");
         return sb.toString();
     }
 

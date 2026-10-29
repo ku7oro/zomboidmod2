@@ -1,6 +1,8 @@
 package com.example.zomboidmod;
 
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.entity.event.v1.EntitySleepEvents;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
@@ -55,6 +57,7 @@ public class ZomboidMod implements ModInitializer {
     private static final Map<UUID, Integer> RIVER_PROGRESS = new HashMap<>();
     private static final Map<UUID, Integer> RIVER_LAST = new HashMap<>();
     private static final Map<UUID, Integer> BOTTLE_LEFT = new HashMap<>();
+    private static final Map<UUID, Long> SLEEP_START = new HashMap<>();
 
     public static Item CLEAN_WATER;
     public static Item BANDAGE;
@@ -165,6 +168,22 @@ public class ZomboidMod implements ModInitializer {
             Wounds.reset(newPlayer);
         });
 
+        // Сон: пока игрок спал, проходят игровые часы - раны заживают, здоровье восстанавливается
+        EntitySleepEvents.START_SLEEPING.register((entity, pos) -> {
+            if (entity instanceof ServerPlayerEntity p) {
+                SLEEP_START.put(p.getUuid(), p.getWorld().getTimeOfDay());
+            }
+        });
+        EntitySleepEvents.STOP_SLEEPING.register((entity, pos) -> {
+            if (entity instanceof ServerPlayerEntity p) {
+                Long start = SLEEP_START.remove(p.getUuid());
+                if (start != null) {
+                    long delta = p.getWorld().getTimeOfDay() - start;
+                    if (delta > 100) Wounds.advanceSleep(p, delta / 1000.0);
+                }
+            }
+        });
+
         // Команды
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(CommandManager.literal("wounds").executes(ctx -> {
@@ -180,6 +199,14 @@ public class ZomboidMod implements ModInitializer {
                         ctx.getSource().sendFeedback(() -> Text.literal("Тестовые раны добавлены"), false);
                         return 1;
                     }))
+                    .then(CommandManager.literal("hour")
+                            .then(CommandManager.argument("seconds", IntegerArgumentType.integer(1, 3600))
+                                    .executes(ctx -> {
+                                        Wounds.hourSeconds = IntegerArgumentType.getInteger(ctx, "seconds");
+                                        ctx.getSource().sendFeedback(() -> Text.literal(
+                                                "1 игровой час PZ = " + Wounds.hourSeconds + " сек"), false);
+                                        return 1;
+                                    })))
                     .then(CommandManager.literal("heal").executes(ctx -> {
                         Wounds.reset(ctx.getSource().getPlayerOrThrow());
                         ctx.getSource().sendFeedback(() -> Text.literal("Все раны и болезни сброшены"), false);

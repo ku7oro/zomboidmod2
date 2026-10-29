@@ -38,7 +38,13 @@ public enum BodyPart {
         return group == BodyGroup.LEG;
     }
 
+    /** Переломы бывают на руках, ногах и верхней части туловища (при тяжёлом падении). */
     public boolean canFracture() {
+        return group == BodyGroup.ARM || group == BodyGroup.LEG || this == UPPER_TORSO;
+    }
+
+    /** Шину можно наложить только на руку или ногу (перелом торса и головы не шинируется). */
+    public boolean canSplint() {
         return group == BodyGroup.ARM || group == BodyGroup.LEG;
     }
 }
