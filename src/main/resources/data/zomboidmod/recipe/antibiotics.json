@@ -1,0 +1,3 @@
+{ "type": "minecraft:crafting_shapeless",
+  "ingredients": [ { "item": "minecraft:fermented_spider_eye" }, { "item": "minecraft:paper" }, { "item": "minecraft:bone_meal" } ],
+  "result": { "id": "zomboidmod:antibiotics", "count": 2 } }

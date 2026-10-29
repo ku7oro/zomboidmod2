@@ -1,6 +1,8 @@
 package com.example.zomboidmod;
 
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.itemgroup.v1.ItemGroupEvents;
@@ -20,6 +22,7 @@ import net.minecraft.registry.Registry;
 import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvents;
@@ -37,27 +40,40 @@ public class ZomboidMod implements ModInitializer {
     public static final String MOD_ID = "zomboidmod";
     public static final int MAX_THIRST = 100;
 
-    // ===== Настройки =====
-    private static final int SECONDS_PER_THIRST_POINT = 12; // -1% жажды раз в 12 сек (бег - в 2 раза быстрее)
-    private static final int RIVER_DRINK_TICKS = 40;        // сколько держать взгляд на воде (2 сек)
-    private static final int RIVER_DRINK_AMOUNT = 10;       // +% жажды за глоток из водоёма
-    private static final float RIVER_POISON_CHANCE = 0.30f; // шанс отравления от водоёма
-    private static final int BOTTLE_DRINK_AMOUNT = 20;      // +% жажды от обычной бутылки с водой
-    private static final float BOTTLE_POISON_CHANCE = 0.15f;// шанс отравления от обычной бутылки
+    // ===== Настройки жажды =====
+    private static final int SECONDS_PER_THIRST_POINT = 12;  // -1% жажды раз в 12 сек (бег - в 2 раза быстрее)
+    private static final int RIVER_DRINK_TICKS = 40;         // сколько держать ПКМ (2 сек = 1 глоток)
+    private static final int RIVER_DRINK_AMOUNT = 10;        // +% жажды за глоток из водоёма
+    private static final float RIVER_POISON_CHANCE = 0.30f;  // шанс отравления от водоёма
+    private static final int BOTTLE_DRINK_AMOUNT = 20;       // +% жажды от обычной бутылки с водой
+    private static final float BOTTLE_POISON_CHANCE = 0.15f; // шанс отравления от обычной бутылки
 
-    private static final Map<UUID, Integer> THIRST = new HashMap<>();
+    // Временные данные (не сохраняются)
     private static final Map<UUID, Integer> TIMER = new HashMap<>();
     private static final Map<UUID, Integer> RIVER_PROGRESS = new HashMap<>();
+    private static final Map<UUID, Integer> RIVER_LAST = new HashMap<>();
     private static final Map<UUID, Integer> BOTTLE_LEFT = new HashMap<>();
 
     public static Item CLEAN_WATER;
+    public static Item BANDAGE;
+    public static Item ANTISEPTIC;
+    public static Item SUTURE_KIT;
+    public static Item SPLINT;
+    public static Item PAINKILLERS;
+    public static Item ANTIBIOTICS;
 
     public static int getThirst(ServerPlayerEntity p) {
-        return THIRST.getOrDefault(p.getUuid(), MAX_THIRST);
+        return ThirstState.get(p.getServer()).thirst.getOrDefault(p.getUuid(), MAX_THIRST);
+    }
+
+    private static void setThirst(ServerPlayerEntity p, int value) {
+        ThirstState state = ThirstState.get(p.getServer());
+        state.thirst.put(p.getUuid(), Math.max(0, Math.min(MAX_THIRST, value)));
+        state.markDirty();
     }
 
     public static void addThirst(ServerPlayerEntity p, int amount) {
-        THIRST.put(p.getUuid(), Math.max(0, Math.min(MAX_THIRST, getThirst(p) + amount)));
+        setThirst(p, getThirst(p) + amount);
         sendThirst(p);
     }
 
@@ -65,32 +81,90 @@ public class ZomboidMod implements ModInitializer {
         ServerPlayNetworking.send(p, new ThirstPayload(getThirst(p)));
     }
 
+    private static Item register(String id, Item item) {
+        return Registry.register(Registries.ITEM, Identifier.of(MOD_ID, id), item);
+    }
+
     @Override
     public void onInitialize() {
-        CLEAN_WATER = Registry.register(Registries.ITEM, Identifier.of(MOD_ID, "clean_water"),
-                new CleanWaterItem(new Item.Settings().maxCount(16)));
+        CLEAN_WATER = register("clean_water", new CleanWaterItem(new Item.Settings().maxCount(16)));
+        BANDAGE = register("bandage", new MedItem(new Item.Settings().maxCount(16), MedItem.Kind.BANDAGE));
+        ANTISEPTIC = register("antiseptic", new MedItem(new Item.Settings().maxCount(16), MedItem.Kind.ANTISEPTIC));
+        SUTURE_KIT = register("suture_kit", new MedItem(new Item.Settings().maxCount(16), MedItem.Kind.SUTURE));
+        SPLINT = register("splint", new MedItem(new Item.Settings().maxCount(16), MedItem.Kind.SPLINT));
+        PAINKILLERS = register("painkillers", new MedItem(new Item.Settings().maxCount(16), MedItem.Kind.PAINKILLERS));
+        ANTIBIOTICS = register("antibiotics", new MedItem(new Item.Settings().maxCount(16), MedItem.Kind.ANTIBIOTICS));
 
         ItemGroupEvents.modifyEntriesEvent(ItemGroups.FOOD_AND_DRINK)
                 .register(entries -> entries.add(CLEAN_WATER));
+        ItemGroupEvents.modifyEntriesEvent(ItemGroups.TOOLS).register(entries -> {
+            entries.add(BANDAGE);
+            entries.add(ANTISEPTIC);
+            entries.add(SUTURE_KIT);
+            entries.add(SPLINT);
+            entries.add(PAINKILLERS);
+            entries.add(ANTIBIOTICS);
+        });
 
         PayloadTypeRegistry.playS2C().register(ThirstPayload.ID, ThirstPayload.CODEC);
+        PayloadTypeRegistry.playS2C().register(WoundsPayload.ID, WoundsPayload.CODEC);
+        PayloadTypeRegistry.playC2S().register(DrinkPayload.ID, DrinkPayload.CODEC);
+
+        // Клиент просит попить из водоёма (Shift + ПКМ)
+        ServerPlayNetworking.registerGlobalReceiver(DrinkPayload.ID,
+                (payload, context) -> requestRiverDrink(context.player(), context.server().getTicks()));
+
+        // Раны от урона
+        ServerLivingEntityEvents.ALLOW_DAMAGE.register((entity, source, amount) -> {
+            if (entity instanceof ServerPlayerEntity p && !p.isCreative() && !p.isSpectator()) {
+                Wounds.onDamage(p, source, amount);
+            }
+            return true;
+        });
 
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             for (ServerPlayerEntity p : server.getPlayerManager().getPlayerList()) {
                 if (!p.isAlive() || p.isCreative() || p.isSpectator()) continue;
                 handleBottle(p);
-                handleRiver(p);
             }
             if (server.getTicks() % 20 == 0) everySecond(server);
         });
 
-        // После смерти жажда сбрасывается
+        // После смерти жажда и раны сбрасываются
         ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) -> {
             UUID id = newPlayer.getUuid();
-            THIRST.remove(id);
+            ThirstState state = ThirstState.get(newPlayer.getServer());
+            state.thirst.remove(id);
+            state.markDirty();
             TIMER.remove(id);
             RIVER_PROGRESS.remove(id);
+            RIVER_LAST.remove(id);
             BOTTLE_LEFT.remove(id);
+            Wounds.reset(newPlayer);
+        });
+
+        // Команды
+        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+            // Для всех: /wounds - список ран
+            dispatcher.register(CommandManager.literal("wounds").executes(ctx -> {
+                ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
+                String text = Wounds.describe(p);
+                ctx.getSource().sendFeedback(() -> Text.literal(text), false);
+                return 1;
+            }));
+            // Для оператора: /zomboid test (набор ран) и /zomboid heal (всё вылечить)
+            dispatcher.register(CommandManager.literal("zomboid")
+                    .requires(src -> src.hasPermissionLevel(2))
+                    .then(CommandManager.literal("test").executes(ctx -> {
+                        Wounds.testWounds(ctx.getSource().getPlayerOrThrow());
+                        ctx.getSource().sendFeedback(() -> Text.literal("Тестовые раны добавлены"), false);
+                        return 1;
+                    }))
+                    .then(CommandManager.literal("heal").executes(ctx -> {
+                        Wounds.reset(ctx.getSource().getPlayerOrThrow());
+                        ctx.getSource().sendFeedback(() -> Text.literal("Все раны и болезни сброшены"), false);
+                        return 1;
+                    })));
         });
     }
 
@@ -119,21 +193,18 @@ public class ZomboidMod implements ModInitializer {
                 .orElse(false);
     }
 
-    // ===== Питьё из водоёма: присесть с пустой рукой и смотреть на воду =====
-    private static void handleRiver(ServerPlayerEntity p) {
+    // ===== Питьё из водоёма: Shift + зажатая ПКМ с пустой рукой =====
+    private static void requestRiverDrink(ServerPlayerEntity p, int tick) {
         UUID id = p.getUuid();
-        boolean looking = false;
-        if (p.isSneaking() && p.getMainHandStack().isEmpty() && getThirst(p) < MAX_THIRST) {
-            HitResult hit = p.raycast(4.0, 1.0f, true);
-            if (hit.getType() == HitResult.Type.BLOCK) {
-                BlockPos bp = ((BlockHitResult) hit).getBlockPos();
-                looking = p.getWorld().getFluidState(bp).isIn(FluidTags.WATER);
-            }
-        }
-        if (!looking) {
+        if (!p.isAlive() || p.isCreative() || p.isSpectator() || !p.isSneaking()
+                || !p.getMainHandStack().isEmpty() || getThirst(p) >= MAX_THIRST || !lookingAtWater(p)) {
             RIVER_PROGRESS.remove(id);
             return;
         }
+        Integer last = RIVER_LAST.get(id);
+        if (last == null || tick - last > 3) RIVER_PROGRESS.put(id, 0); // отпускали кнопку - начинаем заново
+        RIVER_LAST.put(id, tick);
+
         int n = RIVER_PROGRESS.merge(id, 1, Integer::sum);
         if (n == 1) p.sendMessage(Text.literal("Пьёшь из водоёма..."), true);
         if (n >= RIVER_DRINK_TICKS) {
@@ -145,6 +216,13 @@ public class ZomboidMod implements ModInitializer {
         }
     }
 
+    private static boolean lookingAtWater(ServerPlayerEntity p) {
+        HitResult hit = p.raycast(4.5, 1.0f, true);
+        if (hit.getType() != HitResult.Type.BLOCK) return false;
+        BlockPos bp = ((BlockHitResult) hit).getBlockPos();
+        return p.getWorld().getFluidState(bp).isIn(FluidTags.WATER);
+    }
+
     private static void maybePoison(ServerPlayerEntity p, float chance) {
         if (p.getRandom().nextFloat() < chance) {
             p.addStatusEffect(new StatusEffectInstance(StatusEffects.POISON, 160, 0));
@@ -154,7 +232,7 @@ public class ZomboidMod implements ModInitializer {
         }
     }
 
-    // ===== Раз в секунду: убывание жажды и дебафы =====
+    // ===== Раз в секунду: жажда, её дебафы и раны =====
     private static void everySecond(MinecraftServer server) {
         for (ServerPlayerEntity p : server.getPlayerManager().getPlayerList()) {
             if (!p.isAlive() || p.isCreative() || p.isSpectator()) continue;
@@ -162,7 +240,7 @@ public class ZomboidMod implements ModInitializer {
             int t = TIMER.merge(p.getUuid(), p.isSprinting() ? 2 : 1, Integer::sum);
             if (t >= SECONDS_PER_THIRST_POINT) {
                 TIMER.put(p.getUuid(), 0);
-                THIRST.put(p.getUuid(), Math.max(0, getThirst(p) - 1));
+                setThirst(p, getThirst(p) - 1);
             }
 
             int thirst = getThirst(p);
@@ -179,7 +257,9 @@ public class ZomboidMod implements ModInitializer {
             }
 
             sendThirst(p);
+            Wounds.tickSecond(p, server.getTicks());
         }
+        HealthState.get(server).markDirty();
     }
 
     private static void effect(ServerPlayerEntity p, RegistryEntry<StatusEffect> effect, int amplifier) {

@@ -1,1 +1,9 @@
-{ "item.zomboidmod.clean_water": "Чистая вода" }
+{
+  "item.zomboidmod.clean_water": "Чистая вода",
+  "item.zomboidmod.bandage": "Бинт",
+  "item.zomboidmod.antiseptic": "Антисептик",
+  "item.zomboidmod.suture_kit": "Набор для швов",
+  "item.zomboidmod.splint": "Шина",
+  "item.zomboidmod.painkillers": "Обезболивающее",
+  "item.zomboidmod.antibiotics": "Антибиотики"
+}

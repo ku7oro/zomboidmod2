@@ -1,7 +1,12 @@
 {
   "type": "minecraft:smelting",
   "category": "misc",
-  "ingredient": { "item": "minecraft:potion" },
+  "ingredient": {
+    "fabric:type": "fabric:components",
+    "base": "minecraft:potion",
+    "components": { "minecraft:potion_contents": { "potion": "minecraft:water" } },
+    "strict": true
+  },
   "result": { "id": "zomboidmod:clean_water" },
   "experience": 0.1,
   "cookingtime": 200

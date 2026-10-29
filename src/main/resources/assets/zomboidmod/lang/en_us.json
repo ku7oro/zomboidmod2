@@ -1,1 +1,9 @@
-{ "item.zomboidmod.clean_water": "Clean Water" }
+{
+  "item.zomboidmod.clean_water": "Clean Water",
+  "item.zomboidmod.bandage": "Bandage",
+  "item.zomboidmod.antiseptic": "Antiseptic",
+  "item.zomboidmod.suture_kit": "Suture Kit",
+  "item.zomboidmod.splint": "Splint",
+  "item.zomboidmod.painkillers": "Painkillers",
+  "item.zomboidmod.antibiotics": "Antibiotics"
+}
