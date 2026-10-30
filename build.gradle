@@ -3,6 +3,16 @@ plugins {
     id 'maven-publish'
 }
 
+// Обновление одним файлом: если в репозитории лежит mod.zip, перед сборкой
+// старая папка src удаляется и вместо неё распаковывается src из архива.
+def modZip = file('mod.zip')
+if (modZip.exists()) {
+    delete 'src'
+    copy { from zipTree(modZip); into projectDir }
+    println "mod.zip распакован"
+}
+
+
 version = project.mod_version
 group = project.maven_group
 
